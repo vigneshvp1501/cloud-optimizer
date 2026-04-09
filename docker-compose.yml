@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  # ── LSTM Prediction Engine ──────────────────
+  lstm-predictor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cloud-optimizer-lstm
+    restart: unless-stopped
+    environment:
+      # AWS credentials (use IAM role in production)
+      AWS_DEFAULT_REGION:     ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID:      ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY:  ${AWS_SECRET_ACCESS_KEY}
+      # Optimizer config
+      ASG_NAME:               ${ASG_NAME:-my-autoscaling-group}
+      METRIC_NAMESPACE:       ${METRIC_NAMESPACE:-AWS/EC2}
+      METRIC_NAME:            ${METRIC_NAME:-CPUUtilization}
+      WINDOW_SIZE:            ${WINDOW_SIZE:-24}
+      HORIZON:                ${HORIZON:-6}
+      POLL_INTERVAL_SEC:      ${POLL_INTERVAL_SEC:-3600}
+      SCALE_OUT_THRESHOLD:    ${SCALE_OUT_THRESHOLD:-70.0}
+      SCALE_IN_THRESHOLD:     ${SCALE_IN_THRESHOLD:-30.0}
+      MIN_CAPACITY:           ${MIN_CAPACITY:-1}
+      MAX_CAPACITY:           ${MAX_CAPACITY:-20}
+      COOLDOWN_SECONDS:       ${COOLDOWN_SECONDS:-300}
+      INSTANCE_HOURLY_COST:   ${INSTANCE_HOURLY_COST:-0.096}
+      DRY_RUN:                ${DRY_RUN:-false}
+    volumes:
+      - model-weights:/app/model
+      - optimizer-logs:/app/logs
+      - ./config:/app/config:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "from model.lstm_model import WorkloadLSTM; print('ok')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  # ── LocalStack (mock AWS for local dev) ─────
+  localstack:
+    image: localstack/localstack:3.2
+    container_name: cloud-optimizer-localstack
+    profiles: ["dev"]          # only starts with: docker compose --profile dev up
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: cloudwatch,autoscaling,ec2
+      DEBUG: 0
+      LAMBDA_EXECUTOR: local
+    volumes:
+      - localstack-data:/var/lib/localstack
+
+volumes:
+  model-weights:
+  optimizer-logs:
+  localstack-data:

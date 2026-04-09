@@ -1,0 +1,17 @@
+{
+  "region":               "us-east-1",
+  "metric_namespace":     "AWS/EC2",
+  "metric_name":          "CPUUtilization",
+  "asg_name":             "my-autoscaling-group",
+  "window_size":          24,
+  "horizon":              6,
+  "poll_interval_sec":    3600,
+  "model_path":           "/app/model/lstm_weights.json",
+  "scale_out_threshold":  70.0,
+  "scale_in_threshold":   30.0,
+  "min_capacity":         1,
+  "max_capacity":         20,
+  "cooldown_seconds":     300,
+  "instance_hourly_cost": 0.096,
+  "dry_run":              false
+}

@@ -1,0 +1,250 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cloud Resource Optimization System – provisions the Auto Scaling Group,
+  CloudWatch custom metric alarms, IAM role for the LSTM container, and
+  optional ECS Fargate task definition for the prediction engine.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: cloud-optimizer
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy resources in
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the ASG
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  InstanceType:
+    Type: String
+    Default: m5.large
+  MinCapacity:
+    Type: Number
+    Default: 1
+  MaxCapacity:
+    Type: Number
+    Default: 20
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+  ScaleOutThreshold:
+    Type: Number
+    Default: 70
+  ScaleInThreshold:
+    Type: Number
+    Default: 30
+  PredictorImageUri:
+    Type: String
+    Description: ECR URI for the Dockerized LSTM predictor image
+
+Resources:
+  # ── IAM ──────────────────────────────────────
+  OptimizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/AutoScalingFullAccess
+
+  OptimizerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref OptimizerRole]
+
+  # ── Security Group ────────────────────────────
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cloud Optimizer App SG
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # ── Launch Template ───────────────────────────
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-lt"
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt OptimizerInstanceProfile.Arn
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        Monitoring:
+          Enabled: true        # detailed 1-min CloudWatch metrics
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            amazon-linux-extras install docker -y
+            service docker start
+            usermod -a -G docker ec2-user
+
+  # ── Auto Scaling Group ────────────────────────
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: !Ref SubnetIds
+      MinSize: !Ref MinCapacity
+      MaxSize: !Ref MaxCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics:
+            - GroupInServiceInstances
+            - GroupDesiredCapacity
+            - GroupTotalInstances
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-instance"
+          PropagateAtLaunch: true
+
+  # ── Scale-Out Policy ──────────────────────────
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: SimpleScaling
+      ScalingAdjustment: 2
+      AdjustmentType: ChangeInCapacity
+      Cooldown: 300
+
+  # ── Scale-In Policy ───────────────────────────
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: SimpleScaling
+      ScalingAdjustment: -1
+      AdjustmentType: ChangeInCapacity
+      Cooldown: 300
+
+  # ── CloudWatch Alarm: Scale Out ───────────────
+  ScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-scale-out"
+      AlarmDescription: Trigger scale-out when predicted CPU ≥ threshold
+      Namespace: CloudOptimizer/PredictedLoad
+      MetricName: PredictedCPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Sub "${ProjectName}-asg"
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: !Ref ScaleOutThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Statistic: Average
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ScaleOutPolicy]
+      OKActions:    []
+
+  # ── CloudWatch Alarm: Scale In ────────────────
+  ScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-scale-in"
+      AlarmDescription: Trigger scale-in when predicted CPU ≤ threshold
+      Namespace: CloudOptimizer/PredictedLoad
+      MetricName: PredictedCPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Sub "${ProjectName}-asg"
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: !Ref ScaleInThreshold
+      ComparisonOperator: LessThanOrEqualToThreshold
+      Statistic: Average
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref ScaleInPolicy]
+      OKActions:    []
+
+  # ── ECS Cluster for LSTM container ───────────
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-lstm-predictor"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt OptimizerRole.Arn
+      TaskRoleArn:      !GetAtt OptimizerRole.Arn
+      ContainerDefinitions:
+        - Name: lstm-predictor
+          Image: !Ref PredictorImageUri
+          Essential: true
+          Environment:
+            - Name: ASG_NAME
+              Value: !Sub "${ProjectName}-asg"
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: SCALE_OUT_THRESHOLD
+              Value: !Sub "${ScaleOutThreshold}"
+            - Name: SCALE_IN_THRESHOLD
+              Value: !Sub "${ScaleInThreshold}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/ecs/${ProjectName}"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: lstm
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 30
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: !Sub "${ProjectName}-predictor"
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref AppSecurityGroup]
+          AssignPublicIp: ENABLED
+
+Outputs:
+  ASGName:
+    Value: !Sub "${ProjectName}-asg"
+    Export:
+      Name: !Sub "${ProjectName}-ASGName"
+  ScaleOutAlarmArn:
+    Value: !GetAtt ScaleOutAlarm.Arn
+  ScaleInAlarmArn:
+    Value: !GetAtt ScaleInAlarm.Arn
+  ECSClusterArn:
+    Value: !GetAtt ECSCluster.Arn
