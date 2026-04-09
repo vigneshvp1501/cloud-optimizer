@@ -56,7 +56,7 @@ class ASGController:
     respects min/max boundaries and cooldown windows.
     """
 
-    def __init__(self, region: str = "us-east-1", log_path: str = "/app/logs"):
+    def __init__(self, region: str = "us-east-1", log_path: str = "./logs"):
         self.asg    = boto3.client("autoscaling",    region_name=region)
         self.ec2    = boto3.client("ec2",            region_name=region)
         self.region = region
